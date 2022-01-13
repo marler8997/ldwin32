@@ -14,6 +14,7 @@ pub fn build(b: *std.build.Builder) void {
 
 
     const exe = b.addExecutable("execexample", "execexample.zig");
+    exe.single_threaded = true;
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.step.dependOn(&zigwin32_repo.step);

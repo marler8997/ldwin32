@@ -11,56 +11,71 @@ const win32 = struct {
     usingnamespace @import("win32").system.memory;
     usingnamespace @import("win32").system.library_loader;
     usingnamespace @import("win32").system.windows_programming;
+    usingnamespace @import("win32").system.threading;
     usingnamespace @import("win32").storage.file_system;
 };
 const MappedFile = @import("MappedFile.zig");
 
 const log = std.log.scoped(.execve);
 
-pub const ExecveError = error { BadExeFilename } || ExecveWError;
+pub const ExecveError = error { MsvcrtInitArgsFailed } || LoadExeError || LoadImportsError;
 pub fn execve(exe_filename: []const u8) ExecveError {
-    const path_w = std.os.windows.sliceToPrefixedFileW(exe_filename) catch return error.BadExeFilename;
-    return execveW(path_w.span());
-}
-
-pub const ExecveWError = error { Unexpected, OpenExeFailed } || LoadExeError || LoadImportsError;
-pub fn execveW(exe_filename: []const u16) ExecveWError {
-    const load_result = blk: {
-        const exe_file = std.fs.cwd().openFileW(exe_filename, .{}) catch |err| switch (err) {
-            else => |e| {
-                log.err("failed to open '{s}', error={s}", .{std.unicode.fmtUtf16le(exe_filename), @errorName(e)});
-                return error.OpenExeFailed;
-            },
-        };
-        defer std.os.close(exe_file.handle);
-
-        const file_size = try std.os.windows.GetFileSizeEx(exe_file.handle);
-
-        const exe_file_map = try MappedFile.init(exe_file, .{ .len = file_size });
-        defer exe_file_map.deinit();
-        
-        break :blk try loadExe(exe_file_map.ptr[0 .. file_size]);
-    };
-
-    try loadImports(load_result.mem, load_result.nt_header_offset);
+    const load_exe_result = try loadExe(exe_filename);
+    const load_imports_result = try loadImports(load_exe_result.mem, load_exe_result.nt_header_offset);
+    _ = load_imports_result;
 
     // !!!!!!!!!!!!!!!!!!!
     // TODO: TLS Setup???
     // !!!!!!!!!!!!!!!!!!!
 
-    const entry =  load_result.mem.ptr + load_result.AddressOfEntryPoint;
+    const peb = std.os.windows.peb();
+
+    var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const allocator = arena_instance.allocator();
+
+    const image_path_name = std.unicode.utf8ToUtf16LeWithNull(allocator, exe_filename) catch |err| switch (err) {
+        error.OutOfMemory => @panic("Out of memory"),
+        error.InvalidUtf8 => @panic("exe filename is invalid UTF8"),
+    };
+    peb.ProcessParameters.ImagePathName = .{
+        .Buffer = image_path_name.ptr,
+        .Length = @intCast(c_ushort, image_path_name.len),
+        .MaximumLength = @intCast(c_ushort, image_path_name.len),
+    };
+
+    const entry =  load_exe_result.mem.ptr + load_exe_result.AddressOfEntryPoint;
     log.debug("entry is {*}", .{entry});
 
+    //win32.DebugBreak();
     @ptrCast(fn() callconv(std.os.windows.WINAPI) noreturn, entry)();
+    unreachable;
 }
 
-const LoadExeError = error { InvalidExe, ImageAllocFailed };
+const LoadExeError = error { OpenExeFailed, Unexpected } || LoadExeFromContentsError;
 const LoadExe = struct {
     mem: []align(std.mem.page_size) u8,
     nt_header_offset: u31,
     AddressOfEntryPoint: u32,
 };
-fn loadExe(exe_contents: []align(std.mem.page_size) const u8) LoadExeError!LoadExe {
+fn loadExe(exe_filename: []const u8) LoadExeError!LoadExe {
+    const exe_file = std.fs.cwd().openFile(exe_filename, .{}) catch |err| switch (err) {
+        else => |e| {
+            log.err("failed to open '{s}', error={s}", .{exe_filename, @errorName(e)});
+            return error.OpenExeFailed;
+        },
+    };
+    defer std.os.close(exe_file.handle);
+
+    const file_size = try std.os.windows.GetFileSizeEx(exe_file.handle);
+
+    const exe_file_map = try MappedFile.init(exe_file, .{ .len = file_size });
+    defer exe_file_map.deinit();
+
+    return loadExeFromContents(exe_file_map.ptr[0 .. file_size]);
+}
+
+const LoadExeFromContentsError = error { InvalidExe, ImageAllocFailed };
+pub fn loadExeFromContents(exe_contents: []align(std.mem.page_size) const u8) LoadExeFromContentsError!LoadExe {
     if (exe_contents.len < @sizeOf(win32.IMAGE_DOS_HEADER)) {
         log.err("file size {d} is to small for an exe", .{exe_contents.len});
         return error.InvalidExe;
@@ -142,9 +157,47 @@ fn loadExe(exe_contents: []align(std.mem.page_size) const u8) LoadExeError!LoadE
     };
 }
 
+const GetMainArgsFn = fn(
+    out_argc: *c_int,
+    out_argv: *[*][*:0]u8,
+    out_envp: *[*][*:0]u8,
+    do_wildcard: c_int,
+    start_info: ?*win32.STARTUPINFOA,
+) callconv(std.os.windows.WINAPI) c_int;
+
+// functions that are patched
+const patch = struct {
+    pub var __getmainargs_fn: ?GetMainArgsFn = null;
+    fn __getmainargs(
+        out_argc: *c_int,
+        out_argv: *[*][*:0]u8,
+        out_envp: *[*][*:0]u8,
+        do_wildcard: c_int,
+        start_info: ?*win32.STARTUPINFOA,
+    ) callconv(std.os.windows.WINAPI) c_int {
+        log.debug("getmainargs is being called (wildcard={})!", .{do_wildcard});
+        const result = (__getmainargs_fn orelse unreachable)(out_argc, out_argv, out_envp, do_wildcard, start_info);
+        if (result != 0) {
+            log.debug("original __getmainargs failed, GetLastError()={}", .{win32.GetLastError()});
+            return result;
+        }
+        log.debug("    argc={}", .{out_argc.*});
+        for (out_argv.*[0 .. @intCast(usize, out_argc.*)]) |arg, i| {
+            log.debug("    argv[{}] {*} '{s}'", .{i, arg, std.mem.span(arg)});
+        }
+
+        // remove the first argument
+        std.debug.assert(out_argc.* >= 2);
+        out_argc.* = out_argc.* - 1;
+        out_argv.* = out_argv.* + 1;
+
+        return result;
+    }
+};
+
+
 const LoadImportsError = error { LoadLibraryFailed };
 fn loadImports(mem: []align(std.mem.page_size) u8, nt_header_off: usize) LoadImportsError!void {
-
     const nt_header = @ptrCast(
         *const win32.IMAGE_NT_HEADERS64,
         // TODO: does e_lfanew guarnatee alignment?  I'm assuming it does for now.
@@ -180,6 +233,7 @@ fn loadImports(mem: []align(std.mem.page_size) u8, nt_header_off: usize) LoadImp
                     return error.LoadLibraryFailed;
                 };
             };
+            const is_msvcrt = std.mem.eql(u8, std.mem.span(libname), "msvcrt.dll");
 
             // TODO: is alignment guaranteed?
             const name_ref = @alignCast(
@@ -222,7 +276,13 @@ fn loadImports(mem: []align(std.mem.page_size) u8, nt_header_off: usize) LoadImp
                     const func_name = @ptrCast([*:0]u8, &thunk_data.Name);
                     log.debug("    function '{s}'", .{std.mem.span(func_name)});
                     if (win32.GetProcAddress(libhandle, func_name)) |addr| {
-                        symbol_ref[ref_index].u1.AddressOfData = @ptrToInt(addr);
+                        if (is_msvcrt and std.mem.eql(u8, std.mem.span(func_name), "__getmainargs")) {
+                            log.debug("    function '{s}' (setting override)", .{std.mem.span(func_name)});
+                            patch.__getmainargs_fn = @ptrCast(GetMainArgsFn, addr);
+                            symbol_ref[ref_index].u1.AddressOfData = @ptrToInt(patch.__getmainargs);
+                        } else {
+                            symbol_ref[ref_index].u1.AddressOfData = @ptrToInt(addr);
+                        }
                     } else {
                         log.warn("GetProcAddress lib='{s}' func='{s}' failed, error={d}", .{std.mem.span(libname), func_name, win32.GetLastError()});
                     }
@@ -242,7 +302,7 @@ fn loadImports(mem: []align(std.mem.page_size) u8, nt_header_off: usize) LoadImp
 //        WORD* reloc_item;
 //
 //        diff = (DWORD)mem - nt_header->OptionalHeader.ImageBase; //Difference between memory allocated and the executable's required base.
-//        r = (IMAGE_BASE_RELOCATION*)((DWORD)mem + nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress); //The address of the first I_B_R struct 
+//        r = (IMAGE_BASE_RELOCATION*)((DWORD)mem + nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress); //The address of the first I_B_R struct
 //        r_end = (IMAGE_BASE_RELOCATION*)((DWORD_PTR)r + nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size - sizeof(IMAGE_BASE_RELOCATION)); //The addr of the last
 //
 //        for (; r<r_end; r = (IMAGE_BASE_RELOCATION*)((DWORD_PTR)r + r->SizeOfBlock))
@@ -269,7 +329,7 @@ fn loadImports(mem: []align(std.mem.page_size) u8, nt_header_off: usize) LoadImp
 
 fn IMAGE_FIRST_SECTION(nt_header: *const win32.IMAGE_NT_HEADERS64) [*]const win32.IMAGE_SECTION_HEADER {
     return @intToPtr([*]win32.IMAGE_SECTION_HEADER,
-        @ptrToInt(nt_header) +  
+        @ptrToInt(nt_header) +
         @offsetOf(win32.IMAGE_NT_HEADERS64, "OptionalHeader") +
         nt_header.FileHeader.SizeOfOptionalHeader,
     );
